@@ -270,6 +270,258 @@ app.get(
   },
 );
 
+// --- PARTNER MANAGEMENT API ---
+
+/**
+ * @route   POST /api/partners/generate
+ * @desc    Register a new partner and generate unique referral code
+ * @access  Private (Admin Only)
+ */
+app.post(
+  "/api/partners/generate",
+  [
+    body("name")
+      .trim()
+      .notEmpty()
+      .withMessage("Partner name is required / पार्टनर का नाम अनिवार्य है"),
+    body("mobile")
+      .isLength({ min: 10, max: 10 })
+      .withMessage(
+        "Enter valid 10-digit mobile / मान्य 10 अंकों का मोबाइल दर्ज करें",
+      )
+      .isNumeric()
+      .withMessage(
+        "Mobile must be numeric / मोबाइल नंबर केवल अंकों में होना चाहिए",
+      ),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return sendResponse(
+        res,
+        400,
+        false,
+        "Validation Failed / सत्यापन विफल",
+        errors.array(),
+      );
+    }
+
+    try {
+      const { name, mobile } = req.body;
+
+      // 1. Check for existing registration
+      const { data: existingPartner, error: fetchError } = await supabase
+        .from("referral_partners")
+        .select("id, partner_name, referral_code")
+        .eq("mobile", mobile)
+        .maybeSingle();
+
+      if (existingPartner) {
+        return sendResponse(
+          res,
+          409,
+          false,
+          "Partner already registered with this mobile / यह मोबाइल नंबर पहले से पंजीकृत है",
+          existingPartner,
+        );
+      }
+
+      // 2. Generate Professional Referral Code (First 3 chars + Last 4 digits)
+      const sanitizedName = name
+        .replace(/[^a-zA-Z]/g, "")
+        .substring(0, 3)
+        .toUpperCase();
+      const code = `${sanitizedName}${mobile.slice(-4)}`;
+
+      // 3. Database Insertion
+      const { data: newPartner, error: insertError } = await supabase
+        .from("referral_partners")
+        .insert([
+          {
+            partner_name: name,
+            mobile: mobile,
+            referral_code: code,
+            total_earnings: 0,
+            pending_amount: 0,
+            paid_amount: 0,
+            total_applications: 0,
+          },
+        ])
+        .select()
+        .single();
+
+      if (insertError) throw insertError;
+
+      return sendResponse(
+        res,
+        201,
+        true,
+        "Partner registered successfully / पार्टनर सफलतापूर्वक पंजीकृत किया गया",
+        newPartner,
+      );
+    } catch (err) {
+      console.error("Critical Partner Reg Error:", err.message);
+      return sendResponse(
+        res,
+        500,
+        false,
+        "Internal Server Error / सर्वर त्रुटि: पंजीकरण विफल रहा",
+      );
+    }
+  },
+);
+
+/**
+ * @route   GET /api/partners
+ * @desc    Fetch all partners for the Hub overview
+ */
+app.get("/api/partners", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("referral_partners")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+
+    return sendResponse(
+      res,
+      200,
+      true,
+      "Partners data synchronized / डेटा सफलतापूर्वक सिंक किया गया",
+      data,
+    );
+  } catch (err) {
+    console.error("Fetch Error:", err.message);
+    return sendResponse(
+      res,
+      500,
+      false,
+      "Failed to load partners / डेटा लोड करने में विफल",
+    );
+  }
+});
+
+/**
+ * @route   PATCH /api/partners/pay
+ * @desc    Record a payment and update financial balances
+ */
+app.patch(
+  "/api/partners/pay",
+  [
+    body("id").notEmpty().withMessage("Partner ID required"),
+    body("amount").isNumeric().withMessage("Valid amount required"),
+  ],
+  async (req, res) => {
+    const { id, amount } = req.body;
+    const payAmount = Number(amount);
+
+    try {
+      // 1. Fetch current ledger
+      const { data: partner, error: fetchError } = await supabase
+        .from("referral_partners")
+        .select("paid_amount, total_earnings, partner_name")
+        .eq("id", id)
+        .single();
+
+      if (fetchError || !partner) {
+        return sendResponse(
+          res,
+          404,
+          false,
+          "Partner record not found / पार्टनर रिकॉर्ड नहीं मिला",
+        );
+      }
+
+      // 2. Calculate New Balances
+      const newPaid = Number(partner.paid_amount) + payAmount;
+      const newPending = Number(partner.total_earnings) - newPaid;
+
+      // 3. Security Check: Prevent Overpayment
+      if (newPending < 0) {
+        return sendResponse(
+          res,
+          400,
+          false,
+          "Payment exceeds pending balance / भुगतान शेष राशि से अधिक है",
+        );
+      }
+
+      // 4. Atomic Update
+      const { error: updateError } = await supabase
+        .from("referral_partners")
+        .update({
+          paid_amount: newPaid,
+          pending_amount: newPending,
+        })
+        .eq("id", id);
+
+      if (updateError) throw updateError;
+
+      return sendResponse(
+        res,
+        200,
+        true,
+        `Payment of ₹${payAmount} recorded for ${partner.partner_name} / भुगतान सफलतापूर्वक दर्ज किया गया`,
+      );
+    } catch (err) {
+      console.error("Payment Process Error:", err.message);
+      return sendResponse(
+        res,
+        500,
+        false,
+        "Payment processing failed / भुगतान प्रक्रिया विफल रही",
+      );
+    }
+  },
+);
+/**
+ * @route   DELETE /api/partners/:id
+ * @desc    Remove a partner from the system
+ */
+app.delete("/api/partners/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check if partner exists before deleting
+    const { data, error: findError } = await supabase
+      .from("referral_partners")
+      .select("partner_name")
+      .eq("id", id)
+      .single();
+
+    if (!data)
+      return sendResponse(
+        res,
+        404,
+        false,
+        "Partner not found / पार्टनर नहीं मिला",
+      );
+
+    const { error: deleteError } = await supabase
+      .from("referral_partners")
+      .delete()
+      .eq("id", id);
+
+    if (deleteError) throw deleteError;
+
+    return sendResponse(
+      res,
+      200,
+      true,
+      `Partner ${data.partner_name} removed / पार्टनर को हटा दिया गया है`,
+    );
+  } catch (err) {
+    console.error("Delete Error:", err.message);
+    return sendResponse(
+      res,
+      500,
+      false,
+      "Failed to delete partner / पार्टनर को हटाने में विफल",
+    );
+  }
+});
+
 app.listen(PORT, () =>
   console.log(`🚀 R2PS Enterprise API running on port ${PORT}`),
 );
